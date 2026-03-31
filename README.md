@@ -1,2 +1,2 @@
-# Blinkee.city-kickscooter-bruteforce-GIU
-Bruteforce IoT uart communication 
+# Blinkee.city-esc-uart-protocol-gui
+GUI IoT uart communication 
