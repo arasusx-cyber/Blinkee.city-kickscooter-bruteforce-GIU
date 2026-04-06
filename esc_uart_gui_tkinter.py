@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 import tkinter as tk
@@ -16,6 +17,7 @@ HEARTBEAT_DEFAULT_MS = 300
 
 LOG_FILE = Path("esc_uart_gui_log.txt")
 RESP_LOG_FILE = Path("esc_uart_gui_response_changes.txt")
+SCAN_PROGRESS_FILE = Path("esc_uart_scan_progress.json")
 
 
 # ============================================================
@@ -49,6 +51,25 @@ def parse_hex(s: str) -> bytes:
     return bytes(int(p, 16) for p in parts)
 
 
+def parse_payload4_text(s: str) -> bytes:
+    raw = parse_hex(s)
+    if len(raw) != 4:
+        raise ValueError("Podaj dokładnie 4 bajty HEX, np. 00 00 00 00")
+    return raw
+
+
+def payload4_to_int(payload4: bytes) -> int:
+    if len(payload4) != 4:
+        raise ValueError("Payload musi mieć 4 bajty")
+    return int.from_bytes(payload4, "big")
+
+
+def int_to_payload4(value: int) -> bytes:
+    if not (0 <= value <= 0xFFFFFFFF):
+        raise ValueError("Wartość poza zakresem 32-bit")
+    return value.to_bytes(4, "big")
+
+
 def ts() -> str:
     return time.strftime("%H:%M:%S")
 
@@ -80,6 +101,9 @@ def run_selftest():
     f = build_frame(bytes([0xAA, 0x55, 0x01, 0x01]))
     assert len(f) == 8
     assert f[:4] == bytes([0xAA, 0x55, 0x01, 0x01])
+    assert parse_payload4_text("00 00 00 00") == bytes([0, 0, 0, 0])
+    assert payload4_to_int(bytes([0x12, 0x34, 0x56, 0x78])) == 0x12345678
+    assert int_to_payload4(0x12345678) == bytes([0x12, 0x34, 0x56, 0x78])
 
 
 class SerialWorker:
@@ -91,6 +115,7 @@ class SerialWorker:
         self.rx_queue = Queue()
         self.hb_thread = None
         self.hb_stop = threading.Event()
+        self.tx_lock = threading.Lock()
 
     def connect(self, port: str, baud: int):
         self.disconnect()
@@ -137,8 +162,9 @@ class SerialWorker:
         if not self.is_connected():
             raise RuntimeError("Brak połączenia z portem COM")
         frame = build_frame(payload4)
-        self.ser.write(frame)
-        self.ser.flush()
+        with self.tx_lock:
+            self.ser.write(frame)
+            self.ser.flush()
         self.ui_callback("TX", frame, note)
         return frame
 
@@ -147,8 +173,9 @@ class SerialWorker:
             raise RuntimeError("Brak połączenia z portem COM")
         if len(frame8) != 8:
             raise ValueError("Raw frame musi mieć dokładnie 8 bajtów")
-        self.ser.write(frame8)
-        self.ser.flush()
+        with self.tx_lock:
+            self.ser.write(frame8)
+            self.ser.flush()
         self.ui_callback("TX", frame8, note)
         return frame8
 
@@ -193,8 +220,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ESC UART Safe GUI")
-        self.geometry("1180x760")
-        self.minsize(1000, 650)
+        self.geometry("1240x800")
+        self.minsize(1040, 680)
 
         self.worker = SerialWorker(self.on_serial_event)
         self.safe_mode = tk.BooleanVar(value=True)
@@ -202,29 +229,79 @@ class App(tk.Tk):
         self.port_var = tk.StringVar()
         self.hb_interval_var = tk.StringVar(value=str(HEARTBEAT_DEFAULT_MS))
         self.manual_hex_var = tk.StringVar()
+
         self.scan_window_var = tk.StringVar(value="0.45")
-        self.scan_group_var = tk.StringVar(value="00")
-        self.scan_cmd_from_var = tk.StringVar(value="00")
-        self.scan_cmd_to_var = tk.StringVar(value="0F")
-        self.scan_value_from_var = tk.StringVar(value="00")
-        self.scan_value_to_var = tk.StringVar(value="01")
-        self.scan_len_var = tk.StringVar(value="01")
+        self.scan_from_var = tk.StringVar(value="00 00 00 00")
+        self.scan_to_var = tk.StringVar(value="00 00 00 FF")
         self.scan_delay_var = tk.StringVar(value="200")
 
-        self.autotest_index = 0
+        self.scan_running = False
+        self.scan_thread = None
+        self.scan_stop_event = threading.Event()
+        self.scan_saved_state = None
+
         self.autotest_running = False
-        self.autotest_steps = [
-            ("START", KNOWN["START"]),
-            ("STOP", KNOWN["STOP"]),
-            ("BAT_CLOSE", KNOWN["BAT_CLOSE"]),
-            ("BAT_OPEN", KNOWN["BAT_OPEN"]),
-            ("MODE1", KNOWN["MODE1"]),
-            ("MODE0", KNOWN["MODE0"]),
-        ]
+        self.autotest_current = None
+        self.autotest_from = None
+        self.autotest_to = None
 
         self._build_ui()
         self.refresh_ports()
+        self.load_scan_progress(update_fields=False)
         self.after(100, self._tick)
+
+    # --------------------------------------------------------
+    # Scan progress persistence
+    # --------------------------------------------------------
+    def make_scan_state(self, current_value: int | None = None):
+        start_payload = parse_payload4_text(self.scan_from_var.get().strip())
+        end_payload = parse_payload4_text(self.scan_to_var.get().strip())
+        start_value = payload4_to_int(start_payload)
+        end_value = payload4_to_int(end_payload)
+        if start_value > end_value:
+            raise ValueError("Początek zakresu nie może być większy niż koniec")
+        if current_value is None:
+            current_value = start_value
+        if current_value < start_value:
+            current_value = start_value
+        if current_value > end_value:
+            current_value = end_value
+        return {
+            "start": hx(start_payload),
+            "end": hx(end_payload),
+            "start_int": start_value,
+            "end_int": end_value,
+            "current_int": current_value,
+            "window_s": float(self.scan_window_var.get().strip()),
+            "delay_ms": int(self.scan_delay_var.get().strip()),
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def save_scan_progress(self, current_value: int):
+        state = self.make_scan_state(current_value)
+        SCAN_PROGRESS_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        self.scan_saved_state = state
+        return state
+
+    def load_scan_progress(self, update_fields: bool = True):
+        if not SCAN_PROGRESS_FILE.exists():
+            self.scan_saved_state = None
+            return None
+        try:
+            state = json.loads(SCAN_PROGRESS_FILE.read_text(encoding="utf-8"))
+            required = {"start", "end", "start_int", "end_int", "current_int", "window_s", "delay_ms"}
+            if not required.issubset(state):
+                raise ValueError("Brak wymaganych pól")
+            self.scan_saved_state = state
+            if update_fields:
+                self.scan_from_var.set(state["start"])
+                self.scan_to_var.set(state["end"])
+                self.scan_window_var.set(str(state["window_s"]))
+                self.scan_delay_var.set(str(state["delay_ms"]))
+            return state
+        except Exception:
+            self.scan_saved_state = None
+            return None
 
     # --------------------------------------------------------
     # UI
@@ -242,7 +319,6 @@ class App(tk.Tk):
         ttk.Entry(top, textvariable=self.baud_var, width=8).pack(side="left", padx=(5, 8))
         ttk.Button(top, text="Połącz", command=self.connect_port).pack(side="left")
         ttk.Button(top, text="Rozłącz", command=self.disconnect_port).pack(side="left", padx=(6, 0))
-        ttk.Checkbutton(top, text="Safe mode", variable=self.safe_mode).pack(side="left", padx=(16, 0))
         ttk.Button(top, text="Selftest", command=self.selftest_ui).pack(side="left", padx=(12, 0))
 
         ttk.Button(top, text="Otwórz log ogólny", command=lambda: self.open_file(LOG_FILE)).pack(side="right")
@@ -256,7 +332,6 @@ class App(tk.Tk):
         body.add(left, weight=0)
         body.add(right, weight=1)
 
-        # left controls
         conn_box = ttk.LabelFrame(left, text="Szybkie komendy", padding=8)
         conn_box.pack(fill="x", pady=(0, 10))
 
@@ -286,29 +361,15 @@ class App(tk.Tk):
         ttk.Button(row, text="HB START", command=lambda: self.start_hb("START")).pack(side="left", expand=True, fill="x")
         ttk.Button(row, text="HB STOP", command=self.stop_hb).pack(side="left", expand=True, fill="x", padx=(6, 0))
 
-        scan = ttk.LabelFrame(left, text="Scan zakresów", padding=8)
+        scan = ttk.LabelFrame(left, text="Autoscan 4-bajtowego zakresu", padding=8)
         scan.pack(fill="x", pady=(0, 10))
 
         row = ttk.Frame(scan)
         row.pack(fill="x", pady=(0, 6))
-        ttk.Label(row, text="Group:").pack(side="left")
-        ttk.Entry(row, textvariable=self.scan_group_var, width=6).pack(side="left", padx=(4, 10))
-        ttk.Label(row, text="Len:").pack(side="left")
-        ttk.Entry(row, textvariable=self.scan_len_var, width=6).pack(side="left", padx=(4, 0))
-
-        row = ttk.Frame(scan)
-        row.pack(fill="x", pady=(0, 6))
-        ttk.Label(row, text="CMD od:").pack(side="left")
-        ttk.Entry(row, textvariable=self.scan_cmd_from_var, width=6).pack(side="left", padx=(4, 10))
-        ttk.Label(row, text="do:").pack(side="left")
-        ttk.Entry(row, textvariable=self.scan_cmd_to_var, width=6).pack(side="left", padx=(4, 0))
-
-        row = ttk.Frame(scan)
-        row.pack(fill="x", pady=(0, 6))
-        ttk.Label(row, text="VAL od:").pack(side="left")
-        ttk.Entry(row, textvariable=self.scan_value_from_var, width=6).pack(side="left", padx=(4, 10))
-        ttk.Label(row, text="do:").pack(side="left")
-        ttk.Entry(row, textvariable=self.scan_value_to_var, width=6).pack(side="left", padx=(4, 0))
+        ttk.Label(row, text="Od:").pack(side="left")
+        ttk.Entry(row, textvariable=self.scan_from_var, width=18).pack(side="left", padx=(4, 10))
+        ttk.Label(row, text="Do:").pack(side="left")
+        ttk.Entry(row, textvariable=self.scan_to_var, width=18).pack(side="left", padx=(4, 0))
 
         row = ttk.Frame(scan)
         row.pack(fill="x", pady=(0, 6))
@@ -317,17 +378,23 @@ class App(tk.Tk):
         ttk.Label(row, text="Delay [ms]:").pack(side="left")
         ttk.Entry(row, textvariable=self.scan_delay_var, width=8).pack(side="left", padx=(4, 0))
 
-        ttk.Button(scan, text="Uruchom scan zakresu", command=self.safe_scan).pack(fill="x")
+        row = ttk.Frame(scan)
+        row.pack(fill="x", pady=(0, 6))
+        ttk.Button(row, text="Start od nowa", command=self.scan_start_new).pack(side="left", expand=True, fill="x")
+        ttk.Button(row, text="Stop i zapisz", command=self.scan_stop_save).pack(side="left", expand=True, fill="x", padx=4)
+        ttk.Button(row, text="Wznów", command=self.scan_resume).pack(side="left", expand=True, fill="x")
 
-        auto = ttk.LabelFrame(left, text="Auto test krokowy", padding=8)
+        ttk.Button(scan, text="Wczytaj zapisany postęp do pól", command=self.scan_load_to_fields).pack(fill="x")
+
+        auto = ttk.LabelFrame(left, text="Autotest krokowy na wybranym zakresie", padding=8)
         auto.pack(fill="x", pady=(0, 10))
         self.autotest_label = ttk.Label(auto, text="Nie uruchomiono")
         self.autotest_label.pack(anchor="w", pady=(0, 6))
 
         row = ttk.Frame(auto)
         row.pack(fill="x")
-        ttk.Button(row, text="Start", command=self.autotest_start).pack(side="left", expand=True, fill="x")
-        ttk.Button(row, text="Dalej", command=self.autotest_next).pack(side="left", expand=True, fill="x", padx=4)
+        ttk.Button(row, text="Start zakresu", command=self.autotest_start).pack(side="left", expand=True, fill="x")
+        ttk.Button(row, text="Dalej + wyślij", command=self.autotest_next).pack(side="left", expand=True, fill="x", padx=4)
         ttk.Button(row, text="Powtórz", command=self.autotest_repeat).pack(side="left", expand=True, fill="x")
 
         row2 = ttk.Frame(auto)
@@ -339,15 +406,14 @@ class App(tk.Tk):
         info.pack(fill="both", expand=True)
 
         msg = (
-            "1. Wybierz COM i kliknij Połącz.\n"
-            "2. Testuj najpierw START / STOP ręcznie.\n"
-            "3. Safe mode pilnuje potwierdzeń przy ryzykownych akcjach.\n"
-            "4. Scan zakresów bada group/cmd/value z pól obok.\n"
-            "5. Log zmian odpowiedzi zapisuje tylko ciekawe różnice."
+            "1. Zakres autoscanu wpisujesz jako pełne 4 bajty, np. 00 00 00 00 do FF FF FF FF.\n"
+            "2. Stop i zapisz zapisuje aktualny punkt do pliku JSON, a Wznów startuje od tego miejsca.\n"
+            "3. Start od nowa ignoruje poprzedni postęp i leci od pola \"Od\".\n"
+            "4. Autotest krokowy działa teraz na tym samym zakresie, nie na stałej liście komend.\n"
+            "5. Log zmian zapisuje tylko odpowiedzi różne od bazowej odpowiedzi z pierwszej próbki."
         )
         ttk.Label(info, text=msg, justify="left").pack(anchor="w")
 
-        # right logs
         right_top = ttk.Frame(right)
         right_top.pack(fill="x")
         ttk.Button(right_top, text="Wyczyść log w oknie", command=self.clear_log).pack(side="left")
@@ -393,9 +459,7 @@ class App(tk.Tk):
             messagebox.showerror("Błąd", str(e))
 
     def ask_safe(self, text: str) -> bool:
-        if not self.safe_mode.get():
-            return True
-        return messagebox.askokcancel("Potwierdź", text)
+        return True
 
     def selftest_ui(self):
         try:
@@ -403,6 +467,13 @@ class App(tk.Tk):
             messagebox.showinfo("Selftest", "Selftest OK")
         except Exception as e:
             messagebox.showerror("Selftest", str(e))
+
+    def scan_load_to_fields(self):
+        state = self.load_scan_progress(update_fields=True)
+        if state:
+            self.log_ui(f"[{ts()}] INFO Załadowano zapisany postęp: {state['start']} -> {state['end']} @ {int_to_payload4(state['current_int']).hex().upper()}")
+        else:
+            messagebox.showwarning("Brak", "Brak zapisanego postępu scanu")
 
     # --------------------------------------------------------
     # Serial event bridge
@@ -512,59 +583,98 @@ class App(tk.Tk):
     # --------------------------------------------------------
     # Scan ranges
     # --------------------------------------------------------
-    def safe_scan(self):
-        if not self.ask_safe("Uruchomić scan zakresu? To wyśle serię komend z podanego zakresu."):
-            return
-
+    def parse_scan_form(self):
         try:
-            group = int(self.scan_group_var.get().strip(), 16)
-            cmd_from = int(self.scan_cmd_from_var.get().strip(), 16)
-            cmd_to = int(self.scan_cmd_to_var.get().strip(), 16)
-            val_from = int(self.scan_value_from_var.get().strip(), 16)
-            val_to = int(self.scan_value_to_var.get().strip(), 16)
-            fixed_len = int(self.scan_len_var.get().strip(), 16)
+            start_payload = parse_payload4_text(self.scan_from_var.get().strip())
+            end_payload = parse_payload4_text(self.scan_to_var.get().strip())
+            start_value = payload4_to_int(start_payload)
+            end_value = payload4_to_int(end_payload)
             window_s = float(self.scan_window_var.get().strip())
             delay_ms = int(self.scan_delay_var.get().strip())
-        except ValueError:
-            messagebox.showerror(
-                "Błąd",
-                "Zakresy scanu wpisuj jako HEX, np. 00 / 0F / 01. "
-                "Okno odpowiedzi jako liczba, delay w ms."
+        except ValueError as e:
+            raise ValueError(
+                f"Błędne dane zakresu: {e}.\n"
+                "Wpisuj pełne 4 bajty HEX, np. 00 00 00 00 do 00 00 00 FF."
             )
-            return
 
-        if not (
-            0 <= group <= 0xFF and
-            0 <= cmd_from <= 0xFF and
-            0 <= cmd_to <= 0xFF and
-            0 <= val_from <= 0xFF and
-            0 <= val_to <= 0xFF and
-            0 <= fixed_len <= 0xFF
-        ):
-            messagebox.showerror("Błąd", "Każde pole HEX musi być w zakresie 00..FF")
-            return
-
-        if cmd_from > cmd_to or val_from > val_to:
-            messagebox.showerror("Błąd", "Początek zakresu nie może być większy niż koniec")
-            return
-
+        if start_value > end_value:
+            raise ValueError("Początek zakresu nie może być większy niż koniec")
         if delay_ms < 0 or window_s < 0:
-            messagebox.showerror("Błąd", "Delay i okno odpowiedzi nie mogą być ujemne")
+            raise ValueError("Delay i okno odpowiedzi nie mogą być ujemne")
+
+        return start_value, end_value, window_s, delay_ms
+
+    def scan_start_new(self):
+        if not self.ask_safe("Uruchomić autoscan od nowa dla podanego zakresu?"):
             return
+        try:
+            start_value, end_value, window_s, delay_ms = self.parse_scan_form()
+        except Exception as e:
+            messagebox.showerror("Błąd", str(e))
+            return
+        self.start_scan_worker(start_value, end_value, window_s, delay_ms)
+
+    def scan_resume(self):
+        if self.scan_running:
+            messagebox.showwarning("Scan aktywny", "Autoscan już działa")
+            return
+
+        state = self.load_scan_progress(update_fields=True)
+        if not state:
+            messagebox.showwarning("Brak postępu", "Nie ma zapisanego postępu do wznowienia")
+            return
+
+        current_value = int(state["current_int"])
+        end_value = int(state["end_int"])
+        if current_value > end_value:
+            messagebox.showinfo("Koniec", "Zapisany scan jest już zakończony")
+            return
+
+        if not self.ask_safe(
+            f"Wznowić autoscan od {hx(int_to_payload4(current_value))} do {state['end']}?"
+        ):
+            return
+
+        self.start_scan_worker(current_value, end_value, float(state["window_s"]), int(state["delay_ms"]))
+
+    def scan_stop_save(self):
+        if not self.scan_running:
+            try:
+                start_value, _, _, _ = self.parse_scan_form()
+                state = self.save_scan_progress(start_value)
+                self.log_ui(f"[{ts()}] INFO Scan nie działał. Zapisano punkt startowy: {hx(int_to_payload4(state['current_int']))}")
+            except Exception as e:
+                messagebox.showerror("Błąd", str(e))
+            return
+
+        self.scan_stop_event.set()
+        self.log_ui(f"[{ts()}] INFO Żądanie zatrzymania autoscanu wysłane")
+
+    def start_scan_worker(self, start_value: int, end_value: int, window_s: float, delay_ms: int):
+        if self.scan_running:
+            messagebox.showwarning("Scan aktywny", "Najpierw zatrzymaj obecny autoscan")
+            return
+
+        self.scan_running = True
+        self.scan_stop_event.clear()
 
         def worker():
             baseline = None
             hits = 0
             total = 0
+            current_value = start_value
+            self.save_scan_progress(current_value)
             self.log_ui(
-                f"[{ts()}] INFO SCAN START "
-                f"group={group:02X} cmd={cmd_from:02X}-{cmd_to:02X} "
-                f"val={val_from:02X}-{val_to:02X} len={fixed_len:02X}"
+                f"[{ts()}] INFO SCAN START from={hx(int_to_payload4(start_value))} to={hx(int_to_payload4(end_value))}"
             )
+            try:
+                while current_value <= end_value:
+                    if self.scan_stop_event.is_set():
+                        self.save_scan_progress(current_value)
+                        self.log_ui(f"[{ts()}] INFO SCAN STOP at {hx(int_to_payload4(current_value))}")
+                        return
 
-            for cmd in range(cmd_from, cmd_to + 1):
-                for val in range(val_from, val_to + 1):
-                    payload = bytes([group, cmd, fixed_len, val])
+                    payload = int_to_payload4(current_value)
                     total += 1
                     try:
                         self.worker.clear_rx_queue()
@@ -587,21 +697,53 @@ class App(tk.Tk):
                                 log_append(RESP_LOG_FILE, f"{time.strftime('%Y-%m-%d %H:%M:%S')} RX <brak odpowiedzi>")
                             self.log_ui(f"[{ts()}] DIFF {hx(payload)}")
 
-                        time.sleep(delay_ms / 1000.0)
+                        next_value = current_value + 1
+                        if next_value <= end_value:
+                            self.save_scan_progress(next_value)
+                        else:
+                            self.save_scan_progress(end_value)
+
+                        if delay_ms > 0 and self.scan_stop_event.wait(delay_ms / 1000.0):
+                            next_to_resume = min(current_value + 1, end_value)
+                            self.save_scan_progress(next_to_resume)
+                            self.log_ui(f"[{ts()}] INFO SCAN STOP at {hx(int_to_payload4(next_to_resume))}")
+                            return
+                        current_value += 1
                     except Exception as e:
+                        self.save_scan_progress(current_value)
                         self.log_ui(f"[{ts()}] ERR scan {e}")
                         return
 
-            self.log_ui(f"[{ts()}] INFO SCAN DONE hits={hits} total={total}")
+                done_state = self.save_scan_progress(end_value)
+                done_state["current_int"] = end_value + 1
+                SCAN_PROGRESS_FILE.write_text(json.dumps(done_state, indent=2), encoding="utf-8")
+                self.scan_saved_state = done_state
+                self.log_ui(f"[{ts()}] INFO SCAN DONE hits={hits} total={total}")
+            finally:
+                self.scan_running = False
+                self.scan_stop_event.clear()
 
-        threading.Thread(target=worker, daemon=True).start()
+        self.scan_thread = threading.Thread(target=worker, daemon=True)
+        self.scan_thread.start()
 
     # --------------------------------------------------------
-    # Autotest step-by-step
+    # Autotest step-by-step on selected range
     # --------------------------------------------------------
+    def autotest_prepare_range(self):
+        start_value, end_value, _, _ = self.parse_scan_form()
+        self.autotest_from = start_value
+        self.autotest_to = end_value
+        if self.autotest_current is None or not (start_value <= self.autotest_current <= end_value):
+            self.autotest_current = start_value
+
     def autotest_start(self):
+        try:
+            self.autotest_prepare_range()
+        except Exception as e:
+            messagebox.showerror("Błąd", str(e))
+            return
         self.autotest_running = True
-        self.autotest_index = 0
+        self.autotest_current = self.autotest_from
         self._autotest_show()
 
     def autotest_stop(self):
@@ -609,37 +751,30 @@ class App(tk.Tk):
         self.autotest_label.config(text="Zatrzymano")
 
     def _autotest_show(self):
-        if not self.autotest_running:
+        if not self.autotest_running or self.autotest_current is None:
+            self.autotest_label.config(text="Nie uruchomiono")
             return
-        if self.autotest_index < 0:
-            self.autotest_index = 0
-        if self.autotest_index >= len(self.autotest_steps):
-            self.autotest_label.config(text="Auto test zakończony")
-            self.autotest_running = False
-            return
-
-        name, payload = self.autotest_steps[self.autotest_index]
+        payload = int_to_payload4(self.autotest_current)
+        total = (self.autotest_to - self.autotest_from) + 1
+        index = (self.autotest_current - self.autotest_from) + 1
         self.autotest_label.config(
-            text=f"Krok {self.autotest_index + 1}/{len(self.autotest_steps)}: {name} [{hx(payload)}]"
+            text=f"Krok {index}/{total}: [{hx(payload)}]  zakres: {hx(int_to_payload4(self.autotest_from))} -> {hx(int_to_payload4(self.autotest_to))}"
         )
 
     def autotest_fire_current(self):
-        if not self.autotest_running:
+        if not self.autotest_running or self.autotest_current is None:
             return
 
-        name, payload = self.autotest_steps[self.autotest_index]
-        if name in ("BAT_OPEN", "BAT_CLOSE"):
-            if not self.ask_safe(f"Auto test chce wysłać {name}. Kontynuować?"):
-                return
+        payload = int_to_payload4(self.autotest_current)
 
         def worker():
             try:
                 self.worker.clear_rx_queue()
-                frame = self.worker.send_payload4(payload, f"autotest:{name}")
+                frame = self.worker.send_payload4(payload, f"autotest:{hx(payload)}")
                 responses = self.worker.collect_responses(0.45)
 
                 log_append(RESP_LOG_FILE, "=" * 70)
-                log_append(RESP_LOG_FILE, f"{time.strftime('%Y-%m-%d %H:%M:%S')} AUTOTEST {name}")
+                log_append(RESP_LOG_FILE, f"{time.strftime('%Y-%m-%d %H:%M:%S')} AUTOTEST {hx(payload)}")
                 log_append(RESP_LOG_FILE, f"{time.strftime('%Y-%m-%d %H:%M:%S')} TX {hx(frame)}")
                 if responses:
                     for i, r in enumerate(responses, start=1):
@@ -655,21 +790,22 @@ class App(tk.Tk):
         if not self.autotest_running:
             self.autotest_start()
         self.autotest_fire_current()
-        self.autotest_index += 1
+        if self.autotest_current < self.autotest_to:
+            self.autotest_current += 1
         self._autotest_show()
 
     def autotest_repeat(self):
         if not self.autotest_running:
             self.autotest_start()
         self.autotest_fire_current()
+        self._autotest_show()
 
     def autotest_back(self):
         if not self.autotest_running:
             self.autotest_start()
             return
-        self.autotest_index -= 1
-        if self.autotest_index < 0:
-            self.autotest_index = 0
+        if self.autotest_current > self.autotest_from:
+            self.autotest_current -= 1
         self._autotest_show()
 
 
